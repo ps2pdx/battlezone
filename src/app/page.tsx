@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
-import { database } from '@/lib/firebase';
+import { database, authReady, getAuthToken, databaseURL } from '@/lib/firebase';
 import { ref, set, onValue, remove, onDisconnect } from 'firebase/database';
 
 interface MissileData {
@@ -88,7 +88,7 @@ export default function BattlezoneGame() {
   const explosionSoundRef = useRef<HTMLAudioElement | null>(null);
   const nameLabelRef = useRef<HTMLDivElement | null>(null);
   const playerNameRef = useRef<string | null>(null);
-  const [playerId] = useState(() => `player_${Math.random().toString(36).substr(2, 9)}`);
+  const playerIdRef = useRef<string | null>(null);
   const [playerName, setPlayerName] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState('');
   const [score, setScore] = useState(0);
@@ -130,7 +130,8 @@ export default function BattlezoneGame() {
 
   const handleChatSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim() || !playerName || !database) return;
+    const playerId = playerIdRef.current;
+    if (!chatInput.trim() || !playerName || !database || !playerId) return;
     
     const message = {
       player: playerName,
@@ -138,7 +139,9 @@ export default function BattlezoneGame() {
       timestamp: Date.now(),
     };
     
-    set(ref(database, `battlezone/chat/${Date.now()}_${playerId}`), message).catch(() => {});
+    set(ref(database, `battlezone/chat/${Date.now()}_${playerId}`), message).catch((error) => {
+      console.error('Failed to send chat message:', error);
+    });
     setChatInput('');
   };
 
@@ -161,6 +164,7 @@ export default function BattlezoneGame() {
       let myNameLabel: CSS2DObject | null = null;
       let animationId = 0;
       let staleCleanupInterval: NodeJS.Timeout | null = null;
+      let syncErrorLogged = false;
       
       let moveForward = false;
       let moveBackward = false;
@@ -394,8 +398,10 @@ export default function BattlezoneGame() {
         document.addEventListener('touchstart', onTouchStart);
         document.addEventListener('touchend', onTouchEnd);
 
-        // Firebase sync for other players
-        if (database) {
+        // Firebase sync for other players - requires an authenticated session
+        authReady.then((uid) => {
+          if (!uid || !database) return;
+          playerIdRef.current = uid;
           const db = database; // Capture for use in callbacks
           const playersRef = ref(db, 'battlezone/players');
           
@@ -409,7 +415,9 @@ export default function BattlezoneGame() {
                 const playerState = childSnapshot.val();
                 if (playerState && playerState.timestamp) {
                   if (now - playerState.timestamp > STALE_THRESHOLD) {
-                    remove(ref(db, `battlezone/players/${childSnapshot.key}`)).catch(() => {});
+                    remove(ref(db, `battlezone/players/${childSnapshot.key}`)).catch(() => {
+                      // Another client may have already reaped this player
+                    });
                   }
                 }
               });
@@ -429,7 +437,7 @@ export default function BattlezoneGame() {
             const playerState = childSnapshot.val();
             if (!playerState) return;
 
-            if (pId === playerId) {
+            if (pId === uid) {
               count++;
               if (playerNameRef.current) {
                 playerList.push({
@@ -501,8 +509,8 @@ export default function BattlezoneGame() {
 
           setPlayerCount(count);
           setPlayers(playerList);
-        }, () => {
-          // Handle Firebase errors silently
+        }, (error) => {
+          console.error('Firebase players listener failed:', error);
         });
 
           // Firebase chat listener
@@ -519,10 +527,15 @@ export default function BattlezoneGame() {
             // Sort by timestamp and keep last 50
             messages.sort((a, b) => a.timestamp - b.timestamp);
             setChatMessages(messages.slice(-50));
-          }, () => {
-            // Handle Firebase errors silently
+          }, (error) => {
+            console.error('Firebase chat listener failed:', error);
           });
-        }
+
+          // Auto-remove this player when the connection drops
+          onDisconnect(ref(db, `battlezone/players/${uid}`)).remove().catch((error) => {
+            console.error('Failed to register onDisconnect cleanup:', error);
+          });
+        });
       }
 
       function createStars() {
@@ -939,9 +952,9 @@ export default function BattlezoneGame() {
         });
 
         // Sync player state to Firebase every 10ms
-        if (Date.now() - lastSyncTime > 10 && playerNameRef.current && database) {
+        if (Date.now() - lastSyncTime > 10 && playerNameRef.current && database && playerIdRef.current) {
           lastSyncTime = Date.now();
-          set(ref(database, `battlezone/players/${playerId}`), {
+          set(ref(database, `battlezone/players/${playerIdRef.current}`), {
             name: playerNameRef.current,
             x: tank.position.x,
             z: tank.position.z,
@@ -949,7 +962,12 @@ export default function BattlezoneGame() {
             score: localScore,
             health: localHealth,
             timestamp: Date.now(),
-          }).catch(() => {});
+          }).catch((error) => {
+            if (!syncErrorLogged) {
+              syncErrorLogged = true;
+              console.error('Failed to sync player state to Firebase:', error);
+            }
+          });
         }
 
         if (renderer && scene && camera) {
@@ -978,21 +996,16 @@ export default function BattlezoneGame() {
       init();
       animate();
 
-      // Set up Firebase onDisconnect to auto-remove player when connection is lost
-      if (database) {
-        const playerRef = ref(database, `battlezone/players/${playerId}`);
-        onDisconnect(playerRef).remove().catch(() => {});
-      }
-
-      // Handle browser close/refresh
+      // Handle browser close/refresh - onDisconnect is the safety net, this is the fast path
       const handleBeforeUnload = () => {
-        if (database) {
-          // Use fetch with keepalive for reliable cleanup on page unload
-          fetch(`https://battlezone-e5deb-default-rtdb.firebaseio.com/battlezone/players/${playerId}.json`, {
-            method: 'DELETE',
-            keepalive: true
-          }).catch(() => {});
-        }
+        const playerId = playerIdRef.current;
+        if (!database || !playerId) return;
+        void getAuthToken().then((token) => {
+          if (!token) return;
+          const url = `${databaseURL}/battlezone/players/${playerId}.json?auth=${token}`;
+          // keepalive lets the request outlive the page
+          fetch(url, { method: 'DELETE', keepalive: true }).catch(() => {});
+        });
       };
 
       // Also handle visibility change (tab switch/minimize)
@@ -1018,8 +1031,8 @@ export default function BattlezoneGame() {
         if (staleCleanupInterval) {
           clearInterval(staleCleanupInterval);
         }
-        if (database) {
-          remove(ref(database, `battlezone/players/${playerId}`)).catch(() => {});
+        if (database && playerIdRef.current) {
+          remove(ref(database, `battlezone/players/${playerIdRef.current}`)).catch(() => {});
         }
         if (renderer && renderer.domElement.parentNode) {
           renderer.domElement.parentNode.removeChild(renderer.domElement);
@@ -1031,7 +1044,7 @@ export default function BattlezoneGame() {
     } catch (error) {
       console.error('Failed to initialize game:', error);
     }
-  }, [playerId]);
+  }, []);
 
   return (
     <div ref={containerRef} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', overflow: 'hidden', padding: 0, margin: 0 }}>

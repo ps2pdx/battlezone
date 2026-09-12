@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getDatabase, Database } from 'firebase/database';
+import { getAuth, signInAnonymously, Auth } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || 'AIzaSyAMNLbRC_TbVE6_e6f1azjW7Rvl5H4af68',
@@ -12,23 +13,40 @@ const firebaseConfig = {
 };
 
 let database: Database | null = null;
+let auth: Auth | null = null;
 
 try {
   const app = initializeApp(firebaseConfig);
   database = getDatabase(app);
+  auth = getAuth(app);
 } catch (error) {
   console.error('Firebase initialization failed:', error);
 }
 
-export { database };
+export const authReady: Promise<string | null> =
+  typeof window === 'undefined' || !auth
+    ? Promise.resolve(null)
+    : signInAnonymously(auth)
+        .then((credential) => credential.user.uid)
+        .catch((error) => {
+          console.error(
+            'Firebase anonymous sign-in failed - multiplayer is disabled. ' +
+              'Enable the Anonymous provider in Firebase Console > Authentication > Sign-in method.',
+            error
+          );
+          return null;
+        });
 
-// Suppress Firebase errors in console
-if (typeof window !== 'undefined') {
-  const originalWarn = console.warn;
-  console.warn = (...args: unknown[]) => {
-    if (String(args[0]).includes('Firebase')) {
-      return;
-    }
-    originalWarn(...args);
-  };
+export async function getAuthToken(): Promise<string | null> {
+  if (!auth?.currentUser) return null;
+  try {
+    return await auth.currentUser.getIdToken();
+  } catch (error) {
+    console.error('Failed to get Firebase ID token:', error);
+    return null;
+  }
 }
+
+export const databaseURL = firebaseConfig.databaseURL;
+
+export { database };
