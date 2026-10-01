@@ -1,0 +1,32 @@
+{
+  "rules": {
+    "battlezone": {
+      "players": {
+        ".read": "auth != null",
+        "$uid": {
+          ".write": "auth != null && (auth.uid === $uid || (data.exists() && !newData.exists() && data.child('timestamp').val() < (now - 120000)))",
+          ".validate": "newData.hasChildren(['name', 'x', 'z', 'rotationY', 'score', 'health', 'timestamp'])",
+          "name": { ".validate": "newData.isString() && newData.val().length <= 32" },
+          "x": { ".validate": "newData.isNumber()" },
+          "z": { ".validate": "newData.isNumber()" },
+          "rotationY": { ".validate": "newData.isNumber()" },
+          "score": { ".validate": "newData.isNumber()" },
+          "health": { ".validate": "newData.isNumber()" },
+          "timestamp": { ".validate": "newData.isNumber()" },
+          "$other": { ".validate": false }
+        }
+      },
+      "chat": {
+        ".read": "auth != null",
+        "$messageId": {
+          ".write": "auth != null && !data.exists() && $messageId.contains(auth.uid)",
+          ".validate": "newData.hasChildren(['player', 'message', 'timestamp'])",
+          "player": { ".validate": "newData.isString() && newData.val().length <= 32" },
+          "message": { ".validate": "newData.isString() && newData.val().length <= 500" },
+          "timestamp": { ".validate": "newData.isNumber()" },
+          "$other": { ".validate": false }
+        }
+      }
+    }
+  }
+}
